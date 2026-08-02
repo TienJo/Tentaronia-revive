@@ -233,7 +233,7 @@ class MultiSourceMarketData:
 
 
 # ==========================================
-# 2. 場外基金專用解套策略引擎 (低頻申購低吸 + 階梯式反彈贖回)
+# 2. 解套轉主浪過渡策略引擎
 # ==========================================
 class TradingStrategyEngine:
     @staticmethod
@@ -263,7 +263,7 @@ class TradingStrategyEngine:
         df['RSI14'] = 100 - (100 / (1 + rs))
 
         df['High_20'] = df['High'].shift(1).rolling(20).max()
-        df['Low_20'] = df['Low'].shift(1).rolling(20).min()
+        df['Low_10'] = df['Low'].shift(1).rolling(10).min()
 
         return df
 
@@ -272,7 +272,6 @@ class TradingStrategyEngine:
         df_ind = TradingStrategyEngine.calculate_indicators(df)
         today = df_ind.iloc[-1]
         yesterday = df_ind.iloc[-2]
-        prev_10 = df_ind.iloc[-10:-1]
 
         price = float(today['Close'])
         high = float(today['High'])
@@ -285,21 +284,21 @@ class TradingStrategyEngine:
         atr14 = float(today['ATR14'])
         rsi14 = float(today['RSI14'])
         high_20 = float(today['High_20']) if not np.isnan(today['High_20']) else float(today['High'])
-        low_20 = float(today['Low_20']) if not np.isnan(today['Low_20']) else float(today['Low'])
+        low_10 = float(today['Low_10']) if not np.isnan(today['Low_10']) else float(today['Low'])
 
         vol_ratio = volume / ma10_vol_prev if ma10_vol_prev > 0 else 0.0
-
-        price_low_10 = low < prev_10['Low'].min()
-        rsi_not_low_10 = rsi14 > prev_10['RSI14'].min()
-        rsi_bullish_div = price_low_10 and rsi_not_low_10 and rsi14 < 45
 
         touch_ma20 = (low <= ma20 * 1.015) and (price >= ma20 * 0.985)
         retest_support = touch_ma20 and (vol_ratio < 1.0) and (price > float(today['Open']))
 
+        # 主浪確定條件：MA60 轉向上 + 突破 20 日新高
+        is_bull_wave = ma60_upward and (price >= high_20)
+
         metrics = {
             "Close": price, "High": high, "MA5": ma5, "MA10": ma10, "MA20": ma20, "MA60": ma60,
             "MA60_Trend": "向上走牛 ↗️" if ma60_upward else "走平/向下 ↘️",
-            "Vol_Ratio": vol_ratio, "Bias_MA20": bias_ma20, "ATR14": atr14, "RSI14": rsi14, "High_20": high_20
+            "Vol_Ratio": vol_ratio, "Bias_MA20": bias_ma20, "ATR14": atr14, "RSI14": rsi14,
+            "High_20": high_20, "Low_10": low_10, "Is_Bull_Wave": is_bull_wave
         }
 
         tranches_held = pos_summary['tranches_held']
@@ -309,40 +308,51 @@ class TradingStrategyEngine:
         
         target_shares_1t = int(tranche_budget / price) if price > 0 else 0
 
-        # === 專屬場外基金解套邏輯 (高倉位套牢時) ===
+        # === 專屬套牢與主浪動態過渡邏輯 ===
         if tranches_held > 0 and price < avg_cost:
             loss_pct = ((avg_cost - price) / avg_cost) * 100.0
 
-            # 1. 重大下行風險警示 (連續跌破生命線 MA60)
-            if price < ma60 * 0.97 and float(yesterday['Close']) < ma60:
-                return metrics, [{"type": "error", "action_code": "STOP_LOSS", "title": "🚨 風險警報：淨值跌破 MA60 生命線防守點", "desc": f"當前淨值 ({price:.4f}) 已連日跌破 MA60 季線 ({ma60:.4f})！板塊趨勢轉弱，暫停一切加碼申購，防範下行風險。"}]
+            # 1. 核心防守：MA20 以下且破 10 日最低點，執行防守性減倉
+            if price < ma20 and price < low_10:
+                sell_shares = int(pos_summary['total_shares'] * 0.3)
+                return metrics, [{"type": "error", "action_code": "STOP_LOSS_10", "title": "🚨 觸發止損減碼：MA20 以下跌破近 10 日最低點", "desc": f"當前淨值 ({price:.4f}) 於 MA20 下方跌破近 10 日最低點 ({low_10:.4f})！建議於 15:00 前減碼 30% 份額 (約 {sell_shares:,} 份) 規避風險。"}]
 
-            # 2. 階梯式反彈贖回：虧損縮小至 10% / 5% / 接近回本時分批落袋
+            # 2. 核心防守：淨值在 MA20 以下禁止任何申購
+            if price < ma20:
+                return metrics, [{"type": "warning", "action_code": "LOCK_BUY", "title": "🛡️ 防守觀望狀態：淨值未站回 MA20 前禁止申購", "desc": f"當前淨值 ({price:.4f}) 低於 MA20 月線 ({ma20:.4f})。在站回 MA20 前，禁止任何申購操作。"}]
+
+            # 🚀 3. 【過渡關鍵】：若已確認進入牛市主浪 (MA60 向上 + 破 20 日新高)，取消解套贖回，轉為續抱/加碼
+            if is_bull_wave:
+                if tranches_held < 8.0:
+                    return metrics, [{"type": "success", "action_code": "BUY_T1", "title": "🚀 【過渡至牛市主浪】：取消贖回！強勢突破 20 日高點，加碼申購 1 層", "desc": f"MA60 生命線已向上轉牛，且淨值突破近 20 日新高 ({high_20:.4f})！波段主升浪開啟，正式終止解套贖回，建議申購 1 層 (~${tranche_budget:,.0f} 元，約 {target_shares_1t:,} 份) 追擊獲利。"}]
+                else:
+                    return metrics, [{"type": "success", "action_code": "HOLD", "title": "🚀 【過渡至牛市主浪】：取消贖回！主升浪啟動，重倉續抱放大收益", "desc": f"MA60 轉牛且突破 20 日新高 ({high_20:.4f})！解除所有解套贖回指令，維持高倉位抱緊，享受主升浪收益。"}]
+
+            # 🎯 4. 一般反彈階段的階梯式解套贖回 (僅在 MA60 未轉牛、處於震盪反彈時觸發)
             if loss_pct <= 5.0:
                 sell_shares = int(pos_summary['total_shares'] * 0.3)
-                return metrics, [{"type": "success", "action_code": "REDUCE_RECOVER", "title": "🎯 階梯解套贖回：虧損已縮小至 5% 內！", "desc": f"距離完全回本僅差 {loss_pct:.1f}%！建議於 15:00 前贖回約 30% 份額 (約 {sell_shares:,} 份)，回籠現金降低風險。"}]
-            elif loss_pct <= 10.0 and (bias_ma20 > 5.0 or price >= high_20):
+                return metrics, [{"type": "success", "action_code": "REDUCE_RECOVER", "title": "🎯 階梯解套贖回：虧損收窄至 5% 內，贖回 30%", "desc": f"虧損已收窄至 {loss_pct:.1f}%！在 MA60 生命線未完全轉牛前，建議於 15:00 前贖回 30% 份額 (約 {sell_shares:,} 份) 回籠現金。"}]
+            elif loss_pct <= 10.0 and bias_ma20 > 4.0:
                 sell_shares = int(pos_summary['total_shares'] * 0.2)
-                return metrics, [{"type": "warning", "action_code": "REDUCE_RECOVER", "title": "📌 階梯解套贖回：反彈解套盤賣壓區，分批贖回 20%", "desc": f"虧損已收窄至 {loss_pct:.1f}% 且觸及近期高點/過熱區，建議在 15:00 前贖回 20% 份額 (約 {sell_shares:,} 份)。"}]
+                return metrics, [{"type": "warning", "action_code": "REDUCE_RECOVER", "title": "📌 階梯解套贖回：反彈觸及壓力區，贖回 20%", "desc": f"虧損收窄至 {loss_pct:.1f}%，建議於 15:00 前贖回 20% 份額 (約 {sell_shares:,} 份)。"}]
 
-            # 3. 確定性波段低吸申購 (剩餘資金攤平)
-            if (rsi_bullish_div or retest_support) and tranches_held < 9.5:
-                signal_msg = "RSI 底部背離成立" if rsi_bullish_div else "縮量回踩 MA20 支撐"
-                return metrics, [{"type": "success", "action_code": "BUY_T1", "title": f"🔄 波段低吸申購：{signal_msg}", "desc": f"發出波段低吸買點！建議於 15:00 前申購 1 層機動資金 (~${tranche_budget:,.0f} 元，約 {target_shares_1t:,} 份)，有效拉低平均成本。"}]
+            # 🔄 站回 MA20 後的低吸加碼
+            if retest_support and tranches_held < 9.5:
+                return metrics, [{"type": "success", "action_code": "BUY_T1", "title": "🔄 右側加碼申購：站回 MA20 後縮量回踩獲得支撐", "desc": f"企穩於 MA20 上方並縮量回踩！可於 15:00 前申購 1 層資金 (~${tranche_budget:,.0f} 元，約 {target_shares_1t:,} 份) 拉低成本。"}]
 
-            return metrics, [{"type": "info", "action_code": "HOLD", "title": "🟢 反彈趨勢進行中：無離場/申購條件，持基靜待解套", "desc": f"目前套牢虧損 {loss_pct:.1f}%，淨值穩定在 MA20 之上。無買賣訊號，15:00 前無需任何操作。"}]
+            return metrics, [{"type": "info", "action_code": "HOLD", "title": "🟢 反彈進行中：站穩 MA20 上方，持基靜待解套", "desc": f"目前套牢虧損 {loss_pct:.1f}%，淨值於 MA20 上方穩定運作。無贖回或申購訊號，保持觀望。"}]
 
         # === 完全解套或獲利狀態 ===
         elif tranches_held > 0 and price >= avg_cost:
-            if bias_ma20 > 10.0:
+            if bias_ma20 > 12.0:
                 sell_shares = int(pos_summary['total_shares'] * 0.5)
-                return metrics, [{"type": "warning", "action_code": "REDUCE_50", "title": "🎉 完全解套獲利：淨值過熱，建議贖回 50% 落袋為安", "desc": f"已完全回本並實現獲利！偏離度達到 {bias_ma20:.1f}%，建議贖回一半份額 (約 {sell_shares:,} 份) 鎖定勝果。"}]
-            return metrics, [{"type": "info", "action_code": "HOLD", "title": "🎉 已完全解套盈利！續抱放大收益", "desc": "淨值已超越成本線，維持持有狀態即可。"}]
+                return metrics, [{"type": "warning", "action_code": "REDUCE_50", "title": "🎉 完全解套獲利：偏離度 >12% 過熱，贖回 50% 落袋為安", "desc": f"已完全回本實現獲利！偏離度達 {bias_ma20:.1f}%，建議贖回一半份額 (約 {sell_shares:,} 份) 鎖定勝果。"}]
+            return metrics, [{"type": "info", "action_code": "HOLD", "title": "🎉 已完全解套盈利！牛市主浪持基續抱", "desc": "淨值已超越成本線，維持持有狀態放大獲利。"}]
 
         else:
-            if rsi_bullish_div or retest_support:
+            if retest_support and price >= ma20:
                 return metrics, [{"type": "success", "action_code": "BUY_T1", "title": "🎯 策略建議：15:00 前可申購 1 層底倉", "desc": f"建議申購 1 層資金 (~${tranche_budget:,.0f} 元，約 {target_shares_1t:,} 份)。"}]
-            return metrics, [{"type": "info", "action_code": "HOLD", "title": "💤 觀望階段", "desc": "暫無明確申購訊號，保持觀望。"}]
+            return metrics, [{"type": "info", "action_code": "HOLD", "title": "💤 觀望階段", "desc": "未站回 MA20 或無明確買點，保持觀望。"}]
 
     @staticmethod
     def audit_post_trade(action_type: str, trade_price: float, trade_shares: int, pre_signals: list[dict], pre_pos: dict, metrics: dict) -> tuple[list[dict], list[dict]]:
@@ -353,24 +363,31 @@ class TradingStrategyEngine:
 
         if action_type in ["BUY", "ADD"]:
             if any(code in ['BUY_T1'] for code in advised_codes):
-                audit_items.append({"level": "success", "title": "✅ 依策略建議於 15:00 前申購加碼", "detail": "成功在低吸支撐點申購，有效拉低平均成本。" if pre_pos['unrealized_pnl'] < 0 else "順勢建倉。"})
+                audit_items.append({"level": "success", "title": "✅ 依策略建議申購加碼", "detail": "成功在站穩 MA20 後低吸申購或主浪開啟時加碼。"})
+            elif 'LOCK_BUY' in advised_codes:
+                audit_items.append({"level": "error", "title": "❌ 嚴重違反紀律：MA20 以下禁止任何申購加碼！", "detail": "淨值未站回 MA20 前加碼屬於逆勢攤平，大大增加了套牢風險。"})
             else:
                 audit_items.append({"level": "warning", "title": "⚠️ 非策略性追高/盲目申購", "detail": "當前無確定性買點，盲目申購可能加重套牢負擔。"})
 
         elif action_type == "SELL":
-            if any(code in ['STOP_LOSS', 'REDUCE_RECOVER', 'REDUCE_50'] for code in advised_codes):
-                audit_items.append({"level": "success", "title": "💯 果斷執行階梯解套贖回", "detail": "成功分批回收現金，降減套牢風險！"})
+            if any(code in ['STOP_LOSS_10', 'REDUCE_RECOVER', 'REDUCE_50'] for code in advised_codes):
+                audit_items.append({"level": "success", "title": "💯 果斷執行止損/階梯解套贖回", "detail": "成功降減風險或回收現金！"})
             else:
                 audit_items.append({"level": "info", "title": "ℹ️ 自主贖回離場", "detail": "您選擇主動贖回部分份額回收現金。"})
 
         elif action_type == "NONE":
-            audit_items.append({"level": "success", "title": "💯 策略執行合規", "detail": "當日無操作，持基觀望完全符合策略指引。"})
+            if 'STOP_LOSS_10' in advised_codes:
+                audit_items.append({"level": "error", "title": "🚨 嚴重違規：未執行破近 10 日新低之減碼指令！", "detail": "已觸發 MA20 以下破底減碼條件，未賣出部位將承擔高下行風險。"})
+            else:
+                audit_items.append({"level": "success", "title": "💯 策略執行合規", "detail": "當日無操作，持基觀望完全符合策略指引。"})
 
         ma20 = metrics['MA20']
+        low_10 = metrics['Low_10']
         high_20 = metrics['High_20']
 
-        watchlist_items.append({"title": "🛡️ 核心支撐線 (MA20)", "value": f"{ma20:.4f}", "desc": f"只要每日結算淨值不跌破 {ma20:.4f}，反彈趨勢依然有效。"})
-        watchlist_items.append({"title": "🚀 近期突破解套價 (20日高價)", "value": f"{high_20:.4f}", "desc": "若淨值向上突破此價位，將觸發階梯式解套贖回訊號。"})
+        watchlist_items.append({"title": "🛡️ MA20 禁買防守分界線", "value": f"{ma20:.4f}", "desc": f"淨值於 {ma20:.4f} 以下強行進入『禁買防守狀態』，站回前禁止任何申購。"})
+        watchlist_items.append({"title": "🚨 破底減碼警戒價 (近 10 日最低點)", "value": f"{low_10:.4f}", "desc": f"若淨值在 MA20 以下跌破 {low_10:.4f}，須強制減碼 30% 避險。"})
+        watchlist_items.append({"title": "🚀 牛市主浪確認價 (20 日最高點)", "value": f"{high_20:.4f}", "desc": f"若淨值突破 {high_20:.4f} 且 MA60 向上，系統將自動停止解套贖回，開啟牛市主浪模式！"})
 
         return audit_items, watchlist_items
 
@@ -469,7 +486,7 @@ def compute_position_summary(trades: list, current_price: float, target_capital:
 # ==========================================
 # 4. Streamlit 視覺化 GUI 主介面
 # ==========================================
-st.set_page_config(page_title="場外基金解套助手 App", layout="wide", page_icon="📈")
+st.set_page_config(page_title="場外基金解套與主浪過渡助手 App", layout="wide", page_icon="📈")
 
 if "db" not in st.session_state:
     st.session_state.db = load_db()
@@ -558,7 +575,7 @@ if db.get("stocks"):
         st.sidebar.success(f"已刪除 {del_sym}")
         st.rerun()
 
-st.title("📈 場外基金解套助手 (15:00 前操作專用版)")
+st.title("📈 場外基金解套與主浪過渡助手")
 
 if not active_stock or active_stock not in db["stocks"]:
     st.info("請先在左側邊欄新增自選標的。")
@@ -567,7 +584,7 @@ if not active_stock or active_stock not in db["stocks"]:
 stock_info = db["stocks"][active_stock]
 stock_target_capital = float(stock_info.get("target_capital", 300000.0))
 
-tab1, tab2, tab3 = st.tabs(["📊 解套診斷與申贖對帳", "📐 關鍵技術指標詳情", "🔍 全自選庫一鍵掃描"])
+tab1, tab2, tab3 = st.tabs(["📊 解套/主浪診斷與申贖對帳", "📐 關鍵技術指標詳情", "🔍 全自選庫一鍵掃描"])
 
 with st.spinner(f"正在擷取 {stock_info['name']} 最新行情數據..."):
     try:
@@ -596,7 +613,7 @@ with tab1:
 
     if pos_summary['total_shares'] > 0 and pos_summary['avg_cost'] > metrics['Close']:
         gap_pct = ((pos_summary['avg_cost'] - metrics['Close']) / metrics['Close']) * 100.0
-        st.warning(f"📉 **解套目標提醒**：目前部位處於套牢狀態（虧損 {abs(u_pnl_pct):.2f}%），距離完全回本仍需上漲 **{gap_pct:.2f}%**。請依下方建議於每天 15:00 前決定是否低吸申購或分批贖回。")
+        st.warning(f"📉 **狀態提醒**：目前部位處於套牢狀態（虧損 {abs(u_pnl_pct):.2f}%），距離完全回本仍需上漲 **{gap_pct:.2f}%**。若未來強勢突破 20 日高點 ({metrics['High_20']:.4f}) 且 MA60 轉牛，系統將自動啟動『牛市主浪過渡』！")
 
     st.markdown("---")
 
@@ -623,7 +640,7 @@ with tab1:
         with col_f3:
             trade_shares = st.number_input("成交數量 (份額)", min_value=0, value=1000, step=100)
 
-        trade_note = st.text_input("交易備註 (選填，例如：15:00 前申購 1 層拉低均價)", "")
+        trade_note = st.text_input("交易備註 (選填)", "")
         submit_trade = st.form_submit_button("💾 記錄交易並進行第二次合規分析", type="primary")
 
         stock_action_key = f"last_action_{active_stock}"
@@ -729,21 +746,21 @@ with tab1:
 
 # Tab 2: 指標詳情
 with tab2:
-    st.markdown("### 📐 當日技術指標與解套條件詳情")
+    st.markdown("### 📐 當日技術指標與解套/主浪條件詳情")
     ind_df = pd.DataFrame([
         {"指標項目": "MA5 五日均線", "當前數值": f"{metrics['MA5']:.4f}"},
         {"指標項目": "MA10 十日均線", "當前數值": f"{metrics['MA10']:.4f}"},
-        {"指標項目": "MA20 月線 (解套強弱支撐)", "當前數值": f"{metrics['MA20']:.4f}"},
+        {"指標項目": "MA20 月線 (禁買防守分界線)", "當前數值": f"{metrics['MA20']:.4f}"},
         {"指標項目": "MA60 季線 (生命線趨勢)", "當前數值": f"{metrics['MA60']:.4f} ({metrics['MA60_Trend']})"},
-        {"指標項目": "RSI 14 (底部背離指標)", "當前數值": f"{metrics['RSI14']:.2f} (抄底警戒 < 45)"},
-        {"指標項目": "近 20 日最高淨值 (突破點)", "當前數值": f"{metrics['High_20']:.4f}"},
-        {"指標項目": "14日真實波幅 (ATR14)", "當前數值": f"{metrics['ATR14']:.4f}"},
+        {"指標項目": "近 10 日最低淨值 (破底止損價)", "當前數值": f"{metrics['Low_10']:.4f}"},
+        {"指標項目": "近 20 日最高淨值 (牛市突破價)", "當前數值": f"{metrics['High_20']:.4f}"},
+        {"指標項目": "RSI 14 (底部背離指標)", "當前數值": f"{metrics['RSI14']:.2f}"},
     ])
     st.dataframe(ind_df, use_container_width=True, hide_index=True)
 
 # Tab 3: 全自選掃描
 with tab3:
-    st.markdown("### 🔍 每日全自選場外標的一鍵解套掃描")
+    st.markdown("### 🔍 每日全自選場外標的一鍵解套/主浪掃描")
     if st.button("🚀 開始全自動掃描", type="primary"):
         results = []
         progress_bar = st.progress(0)
@@ -761,12 +778,12 @@ with tab3:
                     "最新淨值": f"{m['Close']:.4f}" if m['Close'] < 10 else f"{m['Close']:.2f}",
                     "持有層數": f"{p_sum['tranches_held']:.1f}層",
                     "RSI 14": f"{m['RSI14']:.1f}",
-                    "20日高點": f"{m['High_20']:.4f}" if m['High_20'] < 10 else f"{m['High_20']:.2f}",
-                    "當日解套指引": sig_summary,
+                    "10日低點": f"{m['Low_10']:.4f}" if m['Low_10'] < 10 else f"{m['Low_10']:.2f}",
+                    "當日操作指引": sig_summary,
                     "數據源": src
                 })
             except Exception as ex:
-                results.append({"代號": sym, "名稱": s_data['name'], "當日解套指引": f"抓取失敗: {ex}"})
+                results.append({"代號": sym, "名稱": s_data['name'], "當日操作指引": f"抓取失敗: {ex}"})
             progress_bar.progress((idx + 1) / len(stocks_dict))
 
         res_df = pd.DataFrame(results)
