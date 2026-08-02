@@ -1,0 +1,36 @@
+{
+    "stocks": {
+        "561160": {
+            "symbol": "561160",
+            "name": "富國電池ETF",
+            "target_capital": 30000.0,
+            "trades": [
+                {
+                    "date": "2026-08-01",
+                    "type": "BUY",
+                    "price": 0.887,
+                    "shares": 27692,
+                    "note": "初始化已有持倉/套牢部位"
+                }
+            ],
+            "peak_price_since_entry": 0.0,
+            "peak_unrealized_pnl": 0.0
+        },
+        "513380": {
+            "symbol": "513380",
+            "name": "恆生科技ETF廣發",
+            "target_capital": 35000.0,
+            "trades": [
+                {
+                    "date": "2026-08-01",
+                    "type": "BUY",
+                    "price": 0.585,
+                    "shares": 53523,
+                    "note": "初始化已有持倉/套牢部位"
+                }
+            ],
+            "peak_price_since_entry": 0.0,
+            "peak_unrealized_pnl": 0.0
+        }
+    }
+}
