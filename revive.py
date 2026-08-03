@@ -529,7 +529,14 @@ def compute_position_summary(trades: list, current_price: float, target_capital:
 # 4. Streamlit 視覺化 GUI 主介面
 # ==========================================
 st.set_page_config(page_title="溫度解套與主浪助手 App", layout="wide", page_icon="📈")
-
+st.markdown("""
+    <style>
+        /* 擴大側邊欄底部的內距，讓最下方選單與按鈕不會被切掉 */
+        [data-testid="stSidebar"] > div:first-child {
+            padding-bottom: 150px;
+        }
+    </style>
+""", unsafe_allow_html=True)
 if "db" not in st.session_state:
     st.session_state.db = load_db()
 
