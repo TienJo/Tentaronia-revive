@@ -233,7 +233,7 @@ class MultiSourceMarketData:
 
 
 # ==========================================
-# 2. 整合「板塊溫度模型」與「解套轉主浪」策略引擎
+# 2. 策略與指標計算引擎
 # ==========================================
 class TradingStrategyEngine:
     @staticmethod
@@ -262,7 +262,6 @@ class TradingStrategyEngine:
         rs = gain / loss
         df['RSI14'] = 100 - (100 / (1 + rs))
 
-        # MACD 計算
         exp1 = df['Close'].ewm(span=12, adjust=False).mean()
         exp2 = df['Close'].ewm(span=26, adjust=False).mean()
         df['MACD'] = exp1 - exp2
@@ -273,35 +272,26 @@ class TradingStrategyEngine:
         df['Low_10'] = df['Low'].shift(1).rolling(10).min()
         df['Low_20'] = df['Low'].shift(1).rolling(20).min()
 
-        # ==========================================
-        # 🔥 板塊/標的「溫度 T」算力公式整合
-        # T = 24%×20日漲幅分位 + 22%×20日區間位置 + 22%×均線結構 + 18%×RSI14 + 14%×MACD動能分位
-        # ==========================================
-        # 1. 20日漲幅百分比分位
+        # 溫度 T 算力公式
         chg_20 = df['Close'].pct_change(20) * 100
         min_20_chg = chg_20.rolling(60).min()
         max_20_chg = chg_20.rolling(60).max()
         f1_chg = np.where(max_20_chg > min_20_chg, (chg_20 - min_20_chg) / (max_20_chg - min_20_chg) * 100, 50.0)
 
-        # 2. 20日區間位置 (Price Level in 20D High/Low)
         f2_pos = np.where(df['High_20'] > df['Low_20'], (df['Close'] - df['Low_20']) / (df['High_20'] - df['Low_20']) * 100, 50.0)
 
-        # 3. 均線結構得分 (多頭排列與得點)
         ma_score = (np.where(df['Close'] > df['MA5'], 25, 0) + 
                     np.where(df['Close'] > df['MA10'], 25, 0) + 
                     np.where(df['Close'] > df['MA20'], 25, 0) + 
                     np.where(df['Close'] > df['MA60'], 25, 0))
 
-        # 4. RSI14 (原生 0~100)
         f4_rsi = df['RSI14'].fillna(50.0)
 
-        # 5. MACD 柱狀動能分位
         hist = df['MACD_Hist']
         min_hist = hist.rolling(60).min()
         max_hist = hist.rolling(60).max()
         f5_macd = np.where(max_hist > min_hist, (hist - min_hist) / (max_hist - min_hist) * 100, 50.0)
 
-        # 綜合權重計算溫度 T
         df['Temperature'] = (0.24 * f1_chg + 0.22 * f2_pos + 0.22 * ma_score + 0.18 * f4_rsi + 0.14 * f5_macd).clip(0, 100)
 
         return df
@@ -313,6 +303,7 @@ class TradingStrategyEngine:
         yesterday = df_ind.iloc[-2]
 
         price = float(today['Close'])
+        prev_close = float(yesterday['Close'])
         high = float(today['High'])
         low = float(today['Low'])
         volume = float(today['Volume'])
@@ -333,8 +324,13 @@ class TradingStrategyEngine:
 
         is_bull_wave = ma60_upward and (price >= high_20)
 
+        # 當日漲跌幅與金額計算
+        daily_change_pct = ((price - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
+        daily_pnl = (price - prev_close) * pos_summary['total_shares'] if pos_summary['total_shares'] > 0 else 0.0
+
         metrics = {
-            "Close": price, "High": high, "MA5": ma5, "MA10": ma10, "MA20": ma20, "MA60": ma60,
+            "Close": price, "Prev_Close": prev_close, "Daily_Change_Pct": daily_change_pct, "Daily_PnL": daily_pnl,
+            "High": high, "MA5": ma5, "MA10": ma10, "MA20": ma20, "MA60": ma60,
             "MA60_Trend": "向上走牛 ↗️" if ma60_upward else "走平/向下 ↘️",
             "Vol_Ratio": vol_ratio, "Bias_MA20": bias_ma20, "ATR14": atr14, "RSI14": rsi14,
             "Temperature": temp, "High_20": high_20, "Low_10": low_10, "Is_Bull_Wave": is_bull_wave
@@ -347,30 +343,25 @@ class TradingStrategyEngine:
         
         target_shares_1t = int(tranche_budget / price) if price > 0 else 0
 
-        # === 融合板塊溫度的解套/主浪判斷 ===
         if tranches_held > 0 and price < avg_cost:
             loss_pct = ((avg_cost - price) / avg_cost) * 100.0
 
-            # 1. 核心防守：MA20 以下且破 10 日最低點
             if price < ma20 and price < low_10:
                 sell_shares = int(pos_summary['total_shares'] * 0.3)
                 return metrics, [{"type": "error", "action_code": "STOP_LOSS_10", "title": "🚨 觸發止損減碼：MA20 以下跌破近 10 日最低點", "desc": f"當前淨值 ({price:.4f}) 於 MA20 下方跌破近 10 日最低點 ({low_10:.4f})！建議於 15:00 前減碼 30% 份額 (約 {sell_shares:,} 份) 規避風險。"}]
 
-            # 2. 核心防守：淨值在 MA20 以下且溫度極低，禁止盲目申購，除非觸發極度冰點反彈
             if price < ma20:
                 if temp <= 15.0:
                     return metrics, [{"type": "success", "action_code": "BUY_T1", "title": f"❄️ 【市場極度冰點 (溫度 {temp:.1f}度)】超跌左側低吸", "desc": f"當前板塊/標的溫度降至 {temp:.1f} 度極度冰點！為高勝率築底區，建議於 15:00 前申購 1 層 (~${tranche_budget:,.0f} 元，約 {target_shares_1t:,} 份) 攤平。"}]
                 else:
                     return metrics, [{"type": "warning", "action_code": "LOCK_BUY", "title": f"🛡️ 防守觀望狀態 (當前溫度 {temp:.1f}度)：淨值未站回 MA20 前禁止申購", "desc": f"淨值 ({price:.4f}) 低於 MA20 月線 ({ma20:.4f})。在重新站回 MA20 之前，禁止進行任何申購。"}]
 
-            # 🚀 3. 【牛市主浪過渡】：MA60 轉牛 + 破 20 日高點 + 溫度過熱 > 70
             if is_bull_wave or (temp >= 70.0 and price >= ma20):
                 if tranches_held < 8.0:
                     return metrics, [{"type": "success", "action_code": "BUY_T1", "title": f"🔥 【過渡至牛市主浪 (溫度 {temp:.1f}度)】：終止解套贖回！加碼 1 層", "desc": f"標的進入高溫主升浪區 ({temp:.1f} 度)！波段強勢開啟，正式終止解套贖回，建議申購 1 層 (~${tranche_budget:,.0f} 元，約 {target_shares_1t:,} 份) 追擊獲利。"}]
                 else:
-                    return metrics, [{"type": "success", "action_code": "HOLD", "title": f"🔥 【過渡至牛市主浪 (溫度 {temp:.1f}度)】：解除贖回，重倉抱緊放大收益", "desc": f"當前處於強勢主升浪，解理解套贖回指令，維持高倉位抱緊，享受主升浪收益。"}]
+                    return metrics, [{"type": "success", "action_code": "HOLD", "title": f"🔥 【過渡至牛市主浪 (溫度 {temp:.1f}度)】：解除贖回，重倉抱緊放大收益", "desc": f"當前處於強勢主升浪，解除解套贖回指令，維持高倉位抱緊，享受主升浪收益。"}]
 
-            # 🎯 4. 一般震盪階段的階梯式解套贖回 (溫度在中溫區 30~65 之間)
             if loss_pct <= 5.0:
                 sell_shares = int(pos_summary['total_shares'] * 0.3)
                 return metrics, [{"type": "success", "action_code": "REDUCE_RECOVER", "title": "🎯 階梯解套贖回：虧損收窄至 5% 內，贖回 30%", "desc": f"虧損已收窄至 {loss_pct:.1f}%！建議於 15:00 前贖回 30% 份額 (約 {sell_shares:,} 份) 回籠現金。"}]
@@ -378,13 +369,11 @@ class TradingStrategyEngine:
                 sell_shares = int(pos_summary['total_shares'] * 0.2)
                 return metrics, [{"type": "warning", "action_code": "REDUCE_RECOVER", "title": "📌 階梯解套贖回：反彈觸及壓力區，贖回 20%", "desc": f"虧損收窄至 {loss_pct:.1f}%，建議於 15:00 前贖回 20% 份額 (約 {sell_shares:,} 份)。"}]
 
-            # 🔄 站回 MA20 後的低吸加碼
             if retest_support and tranches_held < 9.5:
                 return metrics, [{"type": "success", "action_code": "BUY_T1", "title": "🔄 右側加碼申購：站回 MA20 後縮量回踩獲得支撐", "desc": f"企穩於 MA20 上方並縮量回踩！可於 15:00 前申購 1 層資金 (~${tranche_budget:,.0f} 元，約 {target_shares_1t:,} 份) 拉低成本。"}]
 
             return metrics, [{"type": "info", "action_code": "HOLD", "title": f"🟢 溫和反彈中 (當前溫度 {temp:.1f}度)：站穩 MA20，持基靜待解套", "desc": f"目前套牢虧損 {loss_pct:.1f}%，無贖回或申購訊號，15:00 前保持觀望。"}]
 
-        # === 完全解套或獲利狀態 ===
         elif tranches_held > 0 and price >= avg_cost:
             if temp >= 85.0 or bias_ma20 > 12.0:
                 sell_shares = int(pos_summary['total_shares'] * 0.5)
@@ -446,11 +435,11 @@ def save_db(db):
 def load_db():
     default_db = {
         "stocks": {
-            "561160": {
-                "symbol": "561160", "name": "復國電池",
+            "513380": {
+                "symbol": "513380", "name": "恆生科技ETF廣發",
                 "target_capital": 300000.0,
                 "trades": [
-                    {"date": "2026-07-25", "type": "BUY", "price": 0.8870, "shares": 27692, "note": "當前套牢部位校正"}
+                    {"date": "2026-07-25", "type": "BUY", "price": 0.5850, "shares": 53523, "note": "當前套牢部位校正"}
                 ],
                 "peak_price_since_entry": 0.0, "peak_unrealized_pnl": 0.0
             }
@@ -529,14 +518,7 @@ def compute_position_summary(trades: list, current_price: float, target_capital:
 # 4. Streamlit 視覺化 GUI 主介面
 # ==========================================
 st.set_page_config(page_title="溫度解套與主浪助手 App", layout="wide", page_icon="📈")
-st.markdown("""
-    <style>
-        /* 擴大側邊欄底部的內距，讓最下方選單與按鈕不會被切掉 */
-        [data-testid="stSidebar"] > div:first-child {
-            padding-bottom: 150px;
-        }
-    </style>
-""", unsafe_allow_html=True)
+
 if "db" not in st.session_state:
     st.session_state.db = load_db()
 
@@ -624,7 +606,7 @@ if db.get("stocks"):
         st.sidebar.success(f"已刪除 {del_sym}")
         st.rerun()
 
-st.title("📈 場外基金解套與溫度過渡助手 (整合小紅書模型版)")
+st.title("📈 場外基金解套與溫度過渡助手")
 
 if not active_stock or active_stock not in db["stocks"]:
     st.info("請先在左側邊欄新增自選標的。")
@@ -652,15 +634,20 @@ with tab1:
     with col_t2:
         st.caption(f"🟢 行情來源: {source_used}")
 
-    # 加入標的即時溫度指標展示
-    m0, m1, m2, m3, m4, m5 = st.columns(6)
+    # 改為 7 個指標欄位，新增「當日即時損益」
+    m0, m1, m2, m3, m4, m5, m6 = st.columns(7)
     m0.metric("即時標的溫度 T", f"{metrics['Temperature']:.1f} 度", delta="極度冰點" if metrics['Temperature'] <= 15 else "高溫主浪" if metrics['Temperature'] >= 70 else "溫和區")
     m1.metric("當前最新淨值/股價", f"{metrics['Close']:.4f}" if metrics['Close'] < 10 else f"{metrics['Close']:.2f}")
-    m2.metric("持有資金層數", f"{pos_summary['tranches_held']:.1f} / 10 層")
-    m3.metric("持倉平均成本", f"{pos_summary['avg_cost']:.4f}" if pos_summary['avg_cost'] < 10 else f"{pos_summary['avg_cost']:.2f}" if pos_summary['total_shares'] > 0 else "未開倉")
+    
+    # 🆕 新增：當日即時損益欄位
+    daily_pnl_str = f"${metrics['Daily_PnL']:,.0f}" if pos_summary['total_shares'] > 0 else "$0"
+    m2.metric("當日即時損益", daily_pnl_str, delta=f"{metrics['Daily_Change_Pct']:+.2f}%")
+
+    m3.metric("持有資金層數", f"{pos_summary['tranches_held']:.1f} / 10 層")
+    m4.metric("持倉平均成本", f"{pos_summary['avg_cost']:.4f}" if pos_summary['avg_cost'] < 10 else f"{pos_summary['avg_cost']:.2f}" if pos_summary['total_shares'] > 0 else "未開倉")
     u_pnl_pct = (pos_summary['unrealized_pnl'] / pos_summary['total_cost'] * 100.0) if pos_summary['total_cost'] > 0 else 0.0
-    m4.metric("即時未實現損益", f"${pos_summary['unrealized_pnl']:,.0f}", delta=f"{u_pnl_pct:.2f}%" if pos_summary['total_shares'] > 0 else "0%")
-    m5.metric("持有總份額/股數", f"{pos_summary['total_shares']:,}")
+    m5.metric("即時未實現總損益", f"${pos_summary['unrealized_pnl']:,.0f}", delta=f"{u_pnl_pct:.2f}%" if pos_summary['total_shares'] > 0 else "0%")
+    m6.metric("持有總份額/股數", f"{pos_summary['total_shares']:,}")
 
     if pos_summary['total_shares'] > 0 and pos_summary['avg_cost'] > metrics['Close']:
         gap_pct = ((pos_summary['avg_cost'] - metrics['Close']) / metrics['Close']) * 100.0
@@ -800,6 +787,8 @@ with tab2:
     st.markdown("### 📐 當日技術指標與溫度權重拆解詳情")
     ind_df = pd.DataFrame([
         {"指標項目": "🔥 板塊/標的溫度 T", "當前數值": f"{metrics['Temperature']:.1f} 度"},
+        {"指標項目": "📈 當日漲跌幅", "當前數值": f"{metrics['Daily_Change_Pct']:+.2f}%"},
+        {"指標項目": "💵 當日即時損益", "當前數值": f"${metrics['Daily_PnL']:,.0f}"},
         {"指標項目": "MA5 五日均線", "當前數值": f"{metrics['MA5']:.4f}"},
         {"指標項目": "MA10 十日均線", "當前數值": f"{metrics['MA10']:.4f}"},
         {"指標項目": "MA20 月線 (禁買防守分界線)", "當前數值": f"{metrics['MA20']:.4f}"},
@@ -828,6 +817,7 @@ with tab3:
                     "代號": sym, "名稱": s_data['name'], 
                     "即時溫度 T": f"{m['Temperature']:.1f}度",
                     "最新淨值": f"{m['Close']:.4f}" if m['Close'] < 10 else f"{m['Close']:.2f}",
+                    "當日損益": f"${m['Daily_PnL']:,.0f} ({m['Daily_Change_Pct']:+.2f}%)",
                     "持有層數": f"{p_sum['tranches_held']:.1f}層",
                     "RSI 14": f"{m['RSI14']:.1f}",
                     "10日低點": f"{m['Low_10']:.4f}" if m['Low_10'] < 10 else f"{m['Low_10']:.2f}",
